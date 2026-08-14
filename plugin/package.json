@@ -1,0 +1,19 @@
+{
+  "name": "@local/dsh-plugin-installer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Persistent dynamic-Cordis plugin installer: install packages from a dsh-plugin.json file or a Git repository with hot load, and persist installed plugins across DSH restarts.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "license": "MIT"
+}
