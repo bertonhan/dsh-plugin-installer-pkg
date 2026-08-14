@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-plugin-installer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Persistent dynamic-Cordis plugin installer: install packages from a dsh-plugin.json file or a Git repository with hot load, and persist installed plugins across DSH restarts.",
   "type": "module",

@@ -7,7 +7,7 @@
  *   root `dynamicCordisRunner` service with immediate hot load,
  * - persists installed manifests to ${DSH_HOME}/plugin-installer/store.json and
  *   restores them (define + run) when the owning session's agent is created
- *   after a restart.
+ *   after a restart, surfacing restore failures in the settings page.
  */
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
@@ -17,6 +17,8 @@ const STORE_DIR = join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "plugin-
 const STORE_FILE = join(STORE_DIR, "store.json")
 const CSRF_HEADER = "x-dsh-plugin-installer"
 const BODY_LIMIT = 3 * 1024 * 1024
+const VERSION_LIMIT = 64
+const MANIFEST_PATH_LIMIT = 256
 
 const messageOf = (error) =>
   error !== null && typeof error === "object" && typeof error.message === "string"
@@ -36,19 +38,26 @@ async function readStore() {
   try {
     const text = await readFile(STORE_FILE, "utf8")
     const parsed = JSON.parse(text)
-    if (parsed !== null && typeof parsed === "object" && Array.isArray(parsed.plugins)) return parsed
-    return { version: 1, plugins: [] }
+    if (parsed !== null && typeof parsed === "object" && Array.isArray(parsed.plugins)) return { store: parsed, error: undefined }
+    return { store: { version: 1, plugins: [] }, error: `持久化文件格式无效: ${STORE_FILE}` }
   } catch (error) {
-    if (error !== null && typeof error === "object" && error.code === "ENOENT") return { version: 1, plugins: [] }
-    return { version: 1, plugins: [] }
+    if (error !== null && typeof error === "object" && error.code === "ENOENT") return { store: { version: 1, plugins: [] }, error: undefined }
+    if (error instanceof SyntaxError) return { store: { version: 1, plugins: [] }, error: `持久化文件损坏（JSON 解析失败，原始文件仍在 ${STORE_FILE}）: ${messageOf(error)}` }
+    return { store: { version: 1, plugins: [] }, error: `读取持久化文件失败: ${messageOf(error)}` }
   }
 }
 
+// Serialize store writes: several sessions may restore/install concurrently,
+// and they all share one tmp file path.
+let writeChain = Promise.resolve()
 async function writeStore(store) {
-  await mkdir(STORE_DIR, { recursive: true })
-  const tmp = `${STORE_FILE}.tmp`
-  await writeFile(tmp, JSON.stringify(store, null, 2), "utf8")
-  await rename(tmp, STORE_FILE)
+  const snapshot = JSON.stringify(store, null, 2)
+  writeChain = writeChain.then(async () => {
+    await mkdir(STORE_DIR, { recursive: true })
+    await writeFile(`${STORE_FILE}.tmp`, snapshot, "utf8")
+    await rename(`${STORE_FILE}.tmp`, STORE_FILE)
+  })
+  return writeChain
 }
 
 export const inject = ["webServer", "shell", "agents"]
@@ -61,14 +70,22 @@ export function apply(ctx) {
   const rehydrated = new Set() // session ids already restored in this process
   const store = { version: 1, plugins: [] }
   let storeLoaded = false
+  let storeError = ""
+  const queues = new Map() // per-key promise chain: serializes install/copy/remove
 
-  const fail = (message) => ({ ok: false, error: message })
+  function serialized(key, task) {
+    const prev = queues.get(key) ?? Promise.resolve()
+    const next = prev.then(task, task)
+    queues.set(key, next.catch(() => {}))
+    return next
+  }
 
   async function ensureStore() {
     if (!storeLoaded) {
       const data = await readStore()
-      store.version = data.version ?? 1
-      store.plugins = data.plugins
+      store.version = data.store.version ?? 1
+      store.plugins = data.store.plugins
+      storeError = data.error ?? ""
       storeLoaded = true
     }
     return store
@@ -87,6 +104,16 @@ export function apply(ctx) {
     const index = data.plugins.findIndex((candidate) => candidate.key === key && candidate.sessionId === sessionId)
     if (index !== -1) data.plugins.splice(index, 1)
     await writeStore(data)
+  }
+
+  async function noteRestoreError(key, sessionId, message) {
+    const data = await ensureStore()
+    const entry = data.plugins.find((candidate) => candidate.key === key && candidate.sessionId === sessionId)
+    if (entry !== undefined) {
+      if (message === "") delete entry.restoreError
+      else entry.restoreError = String(message).slice(0, 800)
+      await writeStore(data)
+    }
   }
 
   async function resolveAgent(sessionId) {
@@ -119,16 +146,36 @@ export function apply(ctx) {
       if (/^[a-z]{3,6}$/.test(derived)) idPrefix = derived
     }
     if (raw.id !== undefined && (typeof raw.id !== "string" || raw.id.trim() === "")) throw new Error("id 字段必须是非空字符串")
+    let version
+    if (raw.version !== undefined) {
+      if (typeof raw.version !== "string" || raw.version.trim() === "" || raw.version.length > VERSION_LIMIT) throw new Error(`version 字段必须是非空字符串（≤${VERSION_LIMIT} 字符）`)
+      version = raw.version.trim()
+    }
+    let manifestPath = "dsh-plugin.json"
+    if (raw.manifestPath !== undefined) {
+      const candidate = String(raw.manifestPath).trim()
+      if (candidate === "" || candidate.length > MANIFEST_PATH_LIMIT || !/^[A-Za-z0-9._/-]+$/.test(candidate) || candidate.startsWith("/") || candidate.split("/").includes("..")) {
+        throw new Error(`manifestPath 必须是仓库内的相对路径（≤${MANIFEST_PATH_LIMIT} 字符，不含 .. 与绝对路径）`)
+      }
+      manifestPath = candidate
+    }
     return {
       key: raw.id !== undefined ? raw.id.trim() : String(raw.name).trim(),
       name: String(raw.name).trim(),
       purpose: String(raw.purpose).trim(),
       idPrefix,
+      ...(version !== undefined ? { version } : {}),
+      manifestPath,
       code: { ...(host !== undefined ? { host } : {}), ...(client !== undefined ? { client } : {}) }
     }
   }
 
-  function installManifest(manifest, sessionId) {
+  /**
+   * Define one manifest for a session, choosing new-vs-update from the live
+   * registry and the in-memory tracking map. Must run inside serialized(key).
+   * @returns { receipt, plan } for the caller to persist and return.
+   */
+  function defineFor(manifest, sessionId) {
     if (runner === undefined) throw new Error("当前进程没有动态插件运行器（dynamicCordisRunner），无法安装")
     const prior = tracked.get(manifest.key)
     let plan = { kind: "new", pluginId: undefined, mode: "run" }
@@ -163,19 +210,23 @@ export function apply(ctx) {
     }
     tracked.set(manifest.key, { pluginId: receipt.pluginId, sessionId })
     return {
-      ok: true,
-      updated: plan.mode === "update",
-      mode: plan.mode,
-      pluginId: receipt.pluginId,
-      packageId: receipt.packageId,
-      name: receipt.name,
-      purpose: receipt.purpose,
-      hasHostHalf: receipt.hasHostHalf,
-      hasClientHalf: receipt.hasClientHalf
+      receipt,
+      plan,
+      result: {
+        ok: true,
+        updated: plan.mode === "update",
+        mode: plan.mode,
+        pluginId: receipt.pluginId,
+        packageId: receipt.packageId,
+        name: receipt.name,
+        purpose: receipt.purpose,
+        hasHostHalf: receipt.hasHostHalf,
+        hasClientHalf: receipt.hasClientHalf
+      }
     }
   }
 
-  async function manifestFromGit(args) {
+  async function manifestFromGit(args, manifestPath) {
     const url = args.url
     if (typeof url !== "string" || url.trim() === "") throw new Error("请输入 Git 仓库地址")
     const clean = url.trim()
@@ -199,17 +250,17 @@ export function apply(ctx) {
       }
       const fs = ctx.get("fs")
       if (fs === undefined) throw new Error("缺少文件系统服务（fs），无法读取仓库清单")
-      const target = await fs.resolve(dir + "/repo/dsh-plugin.json")
+      const target = await fs.resolve(dir + "/repo/" + manifestPath)
       let text
       try {
         text = await fs.readText(target)
       } catch (error) {
-        throw new Error("仓库根目录没有 dsh-plugin.json 清单文件")
+        throw new Error("仓库中没有找到清单文件（" + manifestPath + "）")
       }
       try {
         return JSON.parse(text)
       } catch (error) {
-        throw new Error("dsh-plugin.json 不是合法 JSON：" + messageOf(error))
+        throw new Error(manifestPath + " 不是合法 JSON：" + messageOf(error))
       }
     } finally {
       try {
@@ -222,21 +273,30 @@ export function apply(ctx) {
   }
 
   async function installedRows(sessionId) {
-    if (runner === undefined) return []
     const agent = await resolveAgent(sessionId)
-    const rows = runner.snapshot(agent)
+    const data = await ensureStore()
+    const rows = runner === undefined ? [] : runner.snapshot(agent)
     const pluginIdToKey = new Map()
-    for (const [key, value] of tracked) pluginIdToKey.set(value.pluginId, key)
-    return rows.map((row) => {
+    const keyToTracked = new Map()
+    for (const [key, value] of tracked) {
+      if (value.sessionId !== sessionId) continue
+      pluginIdToKey.set(value.pluginId, key)
+      keyToTracked.set(key, value)
+    }
+    const ownEntries = data.plugins.filter((entry) => entry.sessionId === sessionId)
+    const keyToEntry = new Map(ownEntries.map((entry) => [entry.key, entry]))
+    const view = rows.map((row) => {
       const current = row.currentPackageId
       const found = current !== undefined ? row.packages.find((p) => p.packageId === current) : undefined
       const picked = found !== undefined ? found : row.packages[0]
       const latest = row.latestRun
       const key = pluginIdToKey.get(row.pluginId)
+      const entry = key !== undefined ? keyToEntry.get(key) : undefined
       return cleanRow({
         pluginId: row.pluginId,
         key,
         persisted: key !== undefined,
+        restored: true,
         name: picked === undefined ? row.pluginId : picked.name,
         purpose: picked === undefined ? "" : picked.purpose,
         packageId: picked === undefined ? undefined : picked.packageId,
@@ -249,9 +309,39 @@ export function apply(ctx) {
         mode: latest === undefined ? undefined : latest.mode,
         hostStatus: latest === undefined || latest.host === undefined ? undefined : latest.host.status,
         clientStatus: latest === undefined || latest.client === undefined ? undefined : latest.client.status,
-        error: latest === undefined || latest.error === undefined ? undefined : latest.error.message
+        error: latest === undefined || latest.error === undefined ? undefined : latest.error.message,
+        version: entry === undefined ? undefined : entry.version,
+        updatedAt: entry === undefined ? undefined : entry.updatedAt,
+        source: entry === undefined ? undefined : entry.source,
+        sourceUrl: entry === undefined ? undefined : entry.sourceUrl,
+        restoreError: entry === undefined ? undefined : entry.restoreError
       })
     })
+    // Store entries that did not (yet) make it into the live registry: restore
+    // still pending (session just created) or restore failed — surface them.
+    for (const entry of ownEntries) {
+      if (keyToTracked.has(entry.key)) continue
+      view.push(cleanRow({
+        key: entry.key,
+        persisted: true,
+        restored: false,
+        name: entry.name,
+        purpose: entry.purpose,
+        version: entry.version,
+        updatedAt: entry.updatedAt,
+        source: entry.source,
+        sourceUrl: entry.sourceUrl,
+        restoreError: entry.restoreError,
+        active: false,
+        status: "none"
+      }))
+    }
+    // Persisted entries owned by OTHER sessions — reusable via /copy. Keys the
+    // current session already owns are omitted (copying again is pointless).
+    const others = data.plugins
+      .filter((entry) => entry.sessionId !== sessionId && !keyToEntry.has(entry.key))
+      .map((entry) => cleanRow({ key: entry.key, sessionId: entry.sessionId, name: entry.name, purpose: entry.purpose, version: entry.version, updatedAt: entry.updatedAt }))
+    return { rows: view, others }
   }
 
   // Restore persisted plugins for a session when its agent comes back to life.
@@ -267,18 +357,14 @@ export function apply(ctx) {
         for (const entry of entries) {
           try {
             const manifest = validateManifest(entry)
-            const receipt = runner.define({
-              plugin: { kind: "new", idPrefix: manifest.idPrefix },
-              name: manifest.name,
-              purpose: manifest.purpose,
-              code: manifest.code,
-              sessionId: agent.id
-            })
-            tracked.set(manifest.key, { pluginId: receipt.pluginId, sessionId: agent.id })
+            manifest.key = entry.key
+            const { receipt } = defineFor(manifest, agent.id)
             const ran = await runner.run(agent, receipt.pluginId, receipt.packageId, "run", undefined)
             if (!ran.ok) ctx.logger.warn(`plugin-installer: restore run of ${receipt.pluginId} not started: ${ran.message ?? ""}`)
+            await noteRestoreError(entry.key, agent.id, "")
           } catch (error) {
             ctx.logger.warn(`plugin-installer: restore failed for ${entry.key ?? "?"}: ${messageOf(error)}`)
+            await noteRestoreError(entry.key, agent.id, messageOf(error)).catch(() => {})
           }
         }
       } catch (error) {
@@ -345,32 +431,92 @@ export function apply(ctx) {
         const sessionId = args.sessionId
         if (typeof sessionId !== "string" || sessionId === "") throw new Error("缺少会话 id（sessionId）")
         let raw
+        let source = "file"
+        let sourceUrl
+        let effectiveManifestPath = "dsh-plugin.json"
         if (args.source === "file") {
           const content = args.content
           if (typeof content !== "string" || content.trim() === "") throw new Error("插件包内容为空")
           if (content.length > 2 * 1024 * 1024) throw new Error("插件包超过 2MB 限制")
           raw = JSON.parse(content)
         } else if (args.source === "git") {
-          raw = await manifestFromGit(args)
+          source = "git"
+          sourceUrl = args.url
+          if (args.manifestPath !== undefined && args.manifestPath !== null) {
+            const candidate = String(args.manifestPath).trim()
+            if (candidate === "" || candidate.length > MANIFEST_PATH_LIMIT || !/^[A-Za-z0-9._/-]+$/.test(candidate) || candidate.startsWith("/") || candidate.split("/").includes("..")) {
+              throw new Error("manifestPath 必须是仓库内的相对路径（≤" + MANIFEST_PATH_LIMIT + " 字符，不含 .. 与绝对路径）")
+            }
+            effectiveManifestPath = candidate
+          }
+          raw = await manifestFromGit(args, effectiveManifestPath)
         } else {
           throw new Error("未知安装来源：" + String(args.source))
         }
         const manifest = validateManifest(raw)
-        const receipt = installManifest(manifest, sessionId)
-        await persistEntry({
-          key: manifest.key,
-          sessionId,
-          name: manifest.name,
-          purpose: manifest.purpose,
-          idPrefix: manifest.idPrefix,
-          ...(manifest.code.host !== undefined ? { host: manifest.code.host } : {}),
-          ...(manifest.code.client !== undefined ? { client: manifest.code.client } : {})
+        result = await serialized(manifest.key, async () => {
+          const { result: receipt } = defineFor(manifest, sessionId)
+          await persistEntry({
+            key: manifest.key,
+            sessionId,
+            name: manifest.name,
+            purpose: manifest.purpose,
+            idPrefix: manifest.idPrefix,
+            source,
+            ...(sourceUrl !== undefined && typeof sourceUrl === "string" ? { sourceUrl } : {}),
+            ...(manifest.version !== undefined ? { version: manifest.version } : {}),
+            manifestPath: effectiveManifestPath,
+            updatedAt: new Date().toISOString(),
+            ...(manifest.code.host !== undefined ? { host: manifest.code.host } : {}),
+            ...(manifest.code.client !== undefined ? { client: manifest.code.client } : {})
+          })
+          return receipt
         })
-        result = receipt
       } else if (pathname.endsWith("/installed-list")) {
         const sessionId = args.sessionId
         if (typeof sessionId !== "string" || sessionId === "") throw new Error("缺少会话 id（sessionId）")
-        result = { ok: true, rows: await installedRows(sessionId) }
+        const { rows, others } = await installedRows(sessionId)
+        result = { ok: true, rows, others, ...(storeError !== "" ? { storeError } : {}) }
+      } else if (pathname.endsWith("/copy")) {
+        const sessionId = args.sessionId
+        const key = args.key
+        if (typeof sessionId !== "string" || sessionId === "") throw new Error("缺少会话 id（sessionId）")
+        if (typeof key !== "string" || key === "") throw new Error("缺少插件标识（key）")
+        const data = await ensureStore()
+        const entry = data.plugins.find((candidate) => candidate.key === key)
+        if (entry === undefined) throw new Error("没有找到该插件的持久化记录（key: " + key + "）")
+        const manifest = validateManifest(entry)
+        manifest.key = entry.key
+        result = await serialized(manifest.key, async () => {
+          const { result: receipt } = defineFor(manifest, sessionId)
+          await persistEntry({
+            key: manifest.key,
+            sessionId,
+            name: manifest.name,
+            purpose: manifest.purpose,
+            idPrefix: manifest.idPrefix,
+            source: "copy",
+            ...(entry.sourceUrl !== undefined ? { sourceUrl: entry.sourceUrl } : {}),
+            ...(manifest.version !== undefined ? { version: manifest.version } : {}),
+            manifestPath: manifest.manifestPath,
+            updatedAt: new Date().toISOString(),
+            ...(manifest.code.host !== undefined ? { host: manifest.code.host } : {}),
+            ...(manifest.code.client !== undefined ? { client: manifest.code.client } : {})
+          })
+          return receipt
+        })
+      } else if (pathname.endsWith("/stop")) {
+        const sessionId = args.sessionId
+        const key = args.key
+        if (typeof sessionId !== "string" || sessionId === "") throw new Error("缺少会话 id（sessionId）")
+        if (typeof key !== "string" || key === "") throw new Error("缺少插件标识（key）")
+        if (runner === undefined) throw new Error("当前进程没有动态插件运行器（dynamicCordisRunner）")
+        const agent = await resolveAgent(sessionId)
+        const prior = tracked.get(key)
+        if (prior === undefined || prior.sessionId !== sessionId) throw new Error("该插件当前没有在运行（或不属于本会话）")
+        const outcome = await runner.stop(agent, prior.pluginId)
+        if (!outcome.ok && outcome.reason !== "not-running") throw new Error(outcome.message ?? "停止失败")
+        result = { ok: true }
       } else if (pathname.endsWith("/remove")) {
         const sessionId = args.sessionId
         const key = args.key
@@ -386,7 +532,7 @@ export function apply(ctx) {
             removed = true
           }
         }
-        await removePersisted(key, sessionId)
+        await serialized(key, () => removePersisted(key, sessionId))
         result = { ok: true, removed }
       } else {
         sendJson(res, 404, { error: "未知路径 " + pathname })

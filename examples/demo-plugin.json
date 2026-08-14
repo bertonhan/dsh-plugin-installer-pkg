@@ -1,0 +1,8 @@
+{
+  "name": "演示插件",
+  "purpose": "用于验证安装器热加载与持久化的最小示例：在 设置-插件 中新增一个 Demo 标签页。",
+  "version": "1.0.0",
+  "idPrefix": "demo",
+  "host": "return { name: 'demo-host', apply(ctx) { console.log('demo plugin host half is up') } }",
+  "client": "return { name: 'demo-client', inject: ['slots'], apply(ctx) { ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({ name: 'settings.plugins.tab', id: 'demo-tab', order: 20, label: 'Demo' }, (props) => React.createElement('div', { style: { padding: 12 } }, React.createElement('p', null, '这是一个通过「安装插件」页热加载进来的演示插件。') ))) } }"
+}

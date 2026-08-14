@@ -22,8 +22,20 @@ echo "== restart helper started $(date '+%F %T') ==" >> "$LOG"
 sleep 1
 PID="$(lsof -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
 if [ -n "$PID" ]; then
-  echo "killing old server pid $PID" >> "$LOG"
-  kill -9 "$PID" 2>/dev/null || true
+  CMDLINE="$(ps -o command= -p "$PID" 2>/dev/null || true)"
+  case "$CMDLINE" in
+    *dsh*)
+      echo "killing old server pid $PID ($CMDLINE)" >> "$LOG"
+      kill -9 "$PID" 2>/dev/null || true
+      ;;
+    *)
+      echo "refusing to kill pid $PID on port $PORT: command line does not look like a dsh server: $CMDLINE" >> "$LOG"
+      echo "请手动确认端口占用进程后再重启。" >> "$LOG"
+      exit 1
+      ;;
+  esac
+else
+  echo "no listener on port $PORT; starting anyway" >> "$LOG"
 fi
 
 for _ in $(seq 1 30); do

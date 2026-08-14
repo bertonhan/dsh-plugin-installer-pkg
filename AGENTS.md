@@ -30,7 +30,8 @@ bash install.sh --profile <profile名>
 
 组合变更必须重启才生效：
 
-- **首选**：告知用户「需要重启 dsh 服务」，由用户在终端自行重启。
+- **首选**：告知用户「需要重启 dsh 服务」，由用户在终端自行重启
+  （优雅退出，会话事件能完整落盘）。
 - **用户同意自动重启**（把以下命令作为本回合**最后一步**执行）：
   ```bash
   bash scripts/restart-dsh.sh <端口> dsh web
@@ -38,8 +39,10 @@ bash install.sh --profile <profile名>
   示例：`bash scripts/restart-dsh.sh 3080 dsh web`
   （若启动命令带前缀，如 `node /path/.bin/dsh web`，原样传入即可。）
 
-  警告：该脚本会 SIGKILL 当前 dsh 进程——也就是你自身——**本轮回合会中断**。
-  执行前明确告知用户：页面会短暂断线并自动重连，之后回复「继续」即可。
+  警告：该脚本会 SIGKILL 当前 dsh 进程——也就是你自身——**本轮回合会中断**
+  （SIGKILL 不触发优雅退出，极少数未落盘的会话增量可能丢失，代价通常
+  可忽略）。执行前明确告知用户：页面会短暂断线并自动重连，之后回复
+  「继续」即可。脚本会先校验监听端口的进程确实是 dsh，防止误杀；
   脚本本身脱离进程树运行，新服务会正常拉起；日志在
   `${TMPDIR:-/tmp}/dsh-restart.log`。
 
@@ -52,6 +55,8 @@ curl -s -o /dev/null -w "%{http_code}" \
 ```
 
 页面「设置 → 插件」应出现「安装插件」标签页。安装器自此每次启动自动生效。
+若用户的会话里安装过插件，打开该会话时它们会自动恢复；带界面的插件在
+安装页列表上出现「批准并加载」按钮，告知用户点一下即可（无需去别的面板）。
 
 ## 路径 B（用户拒绝重启时的降级）：临时热安装
 
@@ -61,15 +66,23 @@ curl -s -o /dev/null -w "%{http_code}" \
 - `code.host` / `code.client` 取清单 `host` / `client` 字段的原文；
 - 然后 `cordis_run` 并请用户在页面批准。
 
-注意：此模式仅当前会话生效、重启后消失，不写任何磁盘文件。
+注意：此模式仅当前会话生效、重启后消失，不写任何磁盘文件；也不含
+持久化、跨会话复用、页内批准等静态版功能。
 
 ## 卸载（用户要求时）
 
-1. 从 profile 的 `cordis.patch.yml` 删除 `plugin-installer` 的 insert 块；
-2. 删除符号链接 `node_modules/@local/dsh-plugin-installer`；
-3. 删除 `$DSH_HOME/plugins/dsh-plugin-installer`；
-4. （可选）删除已安装插件的持久化数据 `$DSH_HOME/plugin-installer/store.json`；
-5. 重启服务。
+```bash
+bash uninstall.sh --profile <profile名>          # 默认连持久化数据一起删除
+bash uninstall.sh --profile <profile名> --keep-data   # 保留已安装插件的持久化数据
+```
+
+脚本删除组合补丁中的挂载块、`node_modules/@local` 符号链接、插件包目录与
+（默认）`$DSH_HOME/plugin-installer` 数据目录；完成后重启服务生效。
+
+## 升级（用户要求时）
+
+重跑 `bash install.sh --profile <profile名>` 即可：插件包会被覆盖为最新
+副本（幂等），随后重启服务生效。
 
 ## 依赖与边界
 
